@@ -8,11 +8,10 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package clisqlclient
+package clisqlexec
 
 import (
-	"fmt"
-
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/pflag"
 )
 
@@ -102,7 +101,7 @@ func (f *TableDisplayFormat) Set(s string) error {
 	case "raw":
 		*f = TableDisplayRaw
 	default:
-		return fmt.Errorf("invalid table display format: %s "+
+		return errors.Newf("invalid table display format: %s "+
 			// Note: rawhtml is omitted intentionally. It is
 			// only supported for the 'gen settings-table' command.
 			"(possible values: tsv, csv, table, records, sql, html, raw)", s)

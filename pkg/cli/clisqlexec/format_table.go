@@ -8,7 +8,7 @@
 // by the Apache License, Version 2.0, included in the file
 // licenses/APL.txt.
 
-package clisqlclient
+package clisqlexec
 
 import (
 	"bytes"
@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding/csv"
@@ -96,7 +97,7 @@ func NewRowSliceIter(allRows [][]string, align string) RowStrIter {
 }
 
 type rowIter struct {
-	rows          Rows
+	rows          clisqlclient.Rows
 	colTypes      []string
 	showMoreChars bool
 }
@@ -138,7 +139,7 @@ func (iter *rowIter) Align() []int {
 	return align
 }
 
-func newRowIter(rows Rows, showMoreChars bool) *rowIter {
+func newRowIter(rows clisqlclient.Rows, showMoreChars bool) *rowIter {
 	return &rowIter{
 		rows:          rows,
 		colTypes:      rows.ColumnTypeNames(),
@@ -158,7 +159,7 @@ func newRowIter(rows Rows, showMoreChars bool) *rowIter {
 type rowReporter interface {
 	describe(w io.Writer, cols []string) error
 	beforeFirstRow(w io.Writer, allRows RowStrIter) error
-	iter(w io.Writer, rowIdx int, row []string) error
+	iter(w, ew io.Writer, rowIdx int, row []string) error
 	doneRows(w io.Writer, seenRows int) error
 	doneNoRows(w io.Writer) error
 }
@@ -174,7 +175,7 @@ type rowReporter interface {
 // regardless of whether an error occurred.
 func render(
 	r rowReporter,
-	w io.Writer,
+	w, ew io.Writer,
 	cols []string,
 	iter RowStrIter,
 	completedHook func(),
@@ -208,7 +209,7 @@ func render(
 		}
 
 		if err != nil && nRows > 0 {
-			fmt.Fprintf(stderr, "(error encountered after some results were delivered)\n")
+			fmt.Fprintf(ew, "(error encountered after some results were delivered)\n")
 		}
 	}()
 
@@ -235,7 +236,7 @@ func render(
 		}
 
 		// Report every row including the first.
-		if err = r.iter(w, nRows, row); err != nil {
+		if err = r.iter(w, ew, nRows, row); err != nil {
 			return err
 		}
 
@@ -319,13 +320,13 @@ func (p *asciiTableReporter) beforeFirstRow(w io.Writer, iter RowStrIter) error 
 // printed during buffering in memory.
 const asciiTableWarnRows = 10000
 
-func (p *asciiTableReporter) iter(_ io.Writer, _ int, row []string) error {
+func (p *asciiTableReporter) iter(_, ew io.Writer, _ int, row []string) error {
 	if p.table == nil {
 		return nil
 	}
 
 	if p.rows == asciiTableWarnRows {
-		fmt.Fprintf(stderr,
+		fmt.Fprintf(ew,
 			"warning: buffering more than %d result rows in client "+
 				"- RAM usage growing, consider another formatter instead\n",
 			asciiTableWarnRows)
@@ -412,7 +413,7 @@ func (p *csvReporter) describe(w io.Writer, cols []string) error {
 	return nil
 }
 
-func (p *csvReporter) iter(_ io.Writer, _ int, row []string) error {
+func (p *csvReporter) iter(_, _ io.Writer, _ int, row []string) error {
 	p.mu.Lock()
 	if len(row) == 0 {
 		_ = p.mu.csvWriter.Write([]string{"# empty"})
@@ -441,7 +442,7 @@ func (p *rawReporter) describe(w io.Writer, cols []string) error {
 	return nil
 }
 
-func (p *rawReporter) iter(w io.Writer, rowIdx int, row []string) error {
+func (p *rawReporter) iter(w, _ io.Writer, rowIdx int, row []string) error {
 	fmt.Fprintf(w, "# row %d\n", rowIdx+1)
 	for _, r := range row {
 		fmt.Fprintf(w, "## %d\n%s\n", len(r), r)
@@ -485,7 +486,7 @@ func (p *htmlReporter) beforeFirstRow(w io.Writer, _ RowStrIter) error {
 	return nil
 }
 
-func (p *htmlReporter) iter(w io.Writer, rowIdx int, row []string) error {
+func (p *htmlReporter) iter(w, _ io.Writer, rowIdx int, row []string) error {
 	fmt.Fprint(w, "<tr>")
 	if p.rowStats {
 		fmt.Fprintf(w, "<td>%d</td>", rowIdx+1)
@@ -536,7 +537,7 @@ func (p *recordReporter) describe(w io.Writer, cols []string) error {
 	return nil
 }
 
-func (p *recordReporter) iter(w io.Writer, rowIdx int, row []string) error {
+func (p *recordReporter) iter(w, _ io.Writer, rowIdx int, row []string) error {
 	if len(p.cols) == 0 {
 		// No record details; a summary will be printed at the end.
 		return nil
@@ -602,7 +603,7 @@ func (p *sqlReporter) describe(w io.Writer, cols []string) error {
 	return nil
 }
 
-func (p *sqlReporter) iter(w io.Writer, _ int, row []string) error {
+func (p *sqlReporter) iter(w, _ io.Writer, _ int, row []string) error {
 	if p.noColumns {
 		fmt.Fprintln(w, "INSERT INTO results(rowid) VALUES (DEFAULT);")
 		return nil
@@ -630,17 +631,15 @@ func (p *sqlReporter) doneRows(w io.Writer, seenRows int) error {
 // makeReporter instantiates a table formatter. It returns the
 // formatter and a cleanup function that must be called in all cases
 // when the formatting completes.
-func makeReporter(
-	w io.Writer, tableDisplayFormat TableDisplayFormat, tableBorderMode int,
-) (rowReporter, func(), error) {
-	switch tableDisplayFormat {
+func (sqlExecCtx *Context) makeReporter(w io.Writer) (rowReporter, func(), error) {
+	switch sqlExecCtx.TableDisplayFormat {
 	case TableDisplayTable:
-		return newASCIITableReporter(tableBorderMode), nil, nil
+		return newASCIITableReporter(sqlExecCtx.TableBorderMode), nil, nil
 
 	case TableDisplayTSV:
 		fallthrough
 	case TableDisplayCSV:
-		reporter, cleanup := makeCSVReporter(w, tableDisplayFormat)
+		reporter, cleanup := makeCSVReporter(w, sqlExecCtx.TableDisplayFormat)
 		return reporter, cleanup, nil
 
 	case TableDisplayRaw:
@@ -659,25 +658,22 @@ func makeReporter(
 		return &sqlReporter{}, nil, nil
 
 	default:
-		return nil, nil, errors.Errorf("unhandled display format: %d", tableDisplayFormat)
+		return nil, nil, errors.Errorf("unhandled display format: %d", sqlExecCtx.TableDisplayFormat)
 	}
 }
 
 // PrintQueryOutput takes a list of column names and a list of row
 // contents writes a formatted table to 'w'.
-func PrintQueryOutput(
-	w io.Writer,
-	cols []string,
-	allRows RowStrIter,
-	tableDisplayFormat TableDisplayFormat,
-	tableBorderMode int,
+// Errors/warnings, if any, are written to 'ew'.
+func (sqlExecCtx *Context) PrintQueryOutput(
+	w, ew io.Writer, cols []string, allRows RowStrIter,
 ) error {
-	reporter, cleanup, err := makeReporter(w, tableDisplayFormat, tableBorderMode)
+	reporter, cleanup, err := sqlExecCtx.makeReporter(w)
 	if err != nil {
 		return err
 	}
 	if cleanup != nil {
 		defer cleanup()
 	}
-	return render(reporter, w, cols, allRows, nil, nil)
+	return render(reporter, w, ew, cols, allRows, nil, nil)
 }
